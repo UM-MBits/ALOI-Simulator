@@ -2,5 +2,5 @@
 GDDR6/
 LPDDR4X/
 long_context_midpoint/
-legacy_optimizations/
+sota_results/
 __pycache__/

@@ -186,7 +186,9 @@ def simulated_comparison(args: argparse.Namespace) -> dict:
         SimpleNamespace(kv_head_tp=True, **common_latency_args), args.context, 1
     )
     pp_handoff_latency = (
-        run_sim.vector_latency(args.dim, args.pcie_lanes_per_device)
+        run_sim.pp_handoff_latency_ms(args.dim, args.pcie_lanes_per_device,
+                               pcie_gen=getattr(args, "pcie_gen", run_sim.DEFAULT_PCIE_GEN),
+                               precision=getattr(args, "precision", "bf16"))
         if args.blocks > 1
         else 0.0
     )
@@ -449,6 +451,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--banks", type=int, default=16)
     parser.add_argument("--sa-height", type=int, default=4)
     parser.add_argument("--pcie-lanes-per-device", type=int, default=1)
+    parser.add_argument("--pcie-gen", type=int, choices=sorted(run_sim.PCIE_GB_PER_LANE),
+                        default=run_sim.DEFAULT_PCIE_GEN)
     parser.add_argument(
         "--output-dir",
         type=Path,

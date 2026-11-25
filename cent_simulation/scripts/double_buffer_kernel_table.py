@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from cycle_breakdown import write_kernel_table
+from cycle_breakdown import render_kernel_cards, write_kernel_table  # noqa: F401  (re-exported)
 
 
 def check(actual, expected, label):
@@ -18,7 +18,13 @@ def check(actual, expected, label):
         raise ValueError(f"{label}: {actual} != {expected}")
 
 
-def write_double_buffer_kernel_table(result, scenario, path, original=None):
+def build_double_buffer_report(result, scenario, original=None):
+    """Kernel report (cycle_breakdown region format) for one scenario.
+
+    ``scenario`` is a model name (WRGB credits applied) or ``"single_buffer"``
+    (source PIM commands, rebased CXL).
+    """
+    single = scenario == "single_buffer"
     if original is None:
         record = result["provenance"]["report"]
         source_path = Path(record["path"])
@@ -29,14 +35,15 @@ def write_double_buffer_kernel_table(result, scenario, path, original=None):
             raise ValueError(f"Original command breakdown changed: {source_path}")
         original = json.loads(content)
     source_regions = {r["region_id"]: r for r in original["regions"]}
-    model = result["models"][scenario]
+    model = result["models"]["dependency_aware" if single else scenario]
     period_ps = result["source"]["reference_clock_period_ps"]
     period_ns = period_ps / 1000.0
     regions = []
     for kernel in model["kernels"]:
         # Omit empty/unsupported rows rather than presenting unmodeled SYNC as
         # a measured zero. Nonzero costs remain fully reconciled below.
-        if kernel["new_total_us_estimate"] == 0:
+        total_us = kernel["old_total_us" if single else "new_total_us_estimate"]
+        if total_us == 0:
             continue
         region_id = kernel["region_id"]
         source = source_regions.get(region_id)
@@ -47,16 +54,17 @@ def write_double_buffer_kernel_table(result, scenario, path, original=None):
                     for c in details["commands"]]
         wrgb = sum(c["gap_cycles"] for c in commands if c["command"] == "WRGB")
         check(wrgb, kernel["old_wrgb_gap_cycles"], f"{region_id} source WRGB")
-        remaining_credit = kernel["hidden_wrgb_cycles"]
+        remaining_credit = 0 if single else kernel["hidden_wrgb_cycles"]
         for command in commands:
             if command["command"] == "WRGB":
                 credit = min(remaining_credit, command["gap_cycles"])
                 command["gap_cycles"] -= credit
                 remaining_credit -= credit
         check(remaining_credit, 0, f"{region_id} WRGB credit")
-        check(sum(c["gap_cycles"] for c in commands if c["command"] == "WRGB"),
-              kernel["exposed_wrgb_cycles"], f"{region_id} remaining WRGB")
-        pim = kernel["new_pim_cycles_estimate"]
+        if not single:
+            check(sum(c["gap_cycles"] for c in commands if c["command"] == "WRGB"),
+                  kernel["exposed_wrgb_cycles"], f"{region_id} remaining WRGB")
+        pim = kernel["old_pim_cycles" if single else "new_pim_cycles_estimate"]
         if pim is None:
             raise ValueError(f"Nonzero kernel has unavailable PIM contribution: {region_id}")
         check(sum(c["gap_cycles"] for c in commands), pim, f"{region_id} PIM buckets")
@@ -70,11 +78,10 @@ def write_double_buffer_kernel_table(result, scenario, path, original=None):
         else:
             pnm = {"formula_cycles": 0, "reference_equivalent_cycles": 0}
             check(pnm_eq, 0, f"{region_id} communication-only PNM")
-        equivalent = kernel["new_block_contribution_cycles_estimate"]
+        equivalent = kernel["old_block_contribution_cycles" if single else "new_block_contribution_cycles_estimate"]
         check(pim + pnm_eq + kernel["cxl_equivalent_cycles"], equivalent,
               f"{region_id} backend sum")
-        check(equivalent * period_ns / 1000, kernel["new_total_us_estimate"],
-              f"{region_id} latency")
+        check(equivalent * period_ns / 1000, total_us, f"{region_id} latency")
         regions.append({
             "region_id": region_id, "display_name": kernel["kernel"],
             "pim_issued_gap_details": {"commands": commands},
@@ -84,22 +91,28 @@ def write_double_buffer_kernel_table(result, scenario, path, original=None):
                 "cxl": {"reference_equivalent_cycles": kernel["cxl_equivalent_cycles"]},
             },
             "reference_equivalent_cycles": equivalent,
-            "legacy_ledger_duration_ns": kernel["new_total_us_estimate"] * 1000,
+            "legacy_ledger_duration_ns": total_us * 1000,
         })
     totals = model["totals"]
-    check(sum(r["legacy_ledger_duration_ns"] for r in regions),
-          totals["new_block_us_analytical"] * 1000, "block latency")
-    for backend, expected in (("pim", totals["new_pim_cycles_analytical"]),
+    block_us = totals["old_block_us" if single else "new_block_us_analytical"]
+    check(sum(r["legacy_ledger_duration_ns"] for r in regions), block_us * 1000, "block latency")
+    pim_total = (totals["new_pim_cycles_analytical"] + (totals["hidden_wrgb_cycles"] if single else 0))
+    for backend, expected in (("pim", pim_total),
                               ("pnm", totals["pnm_us_frozen"] * 1000 / period_ns),
                               ("cxl", totals["cxl_us_frozen"] * 1000 / period_ns)):
         check(sum(r["backends"][backend]["reference_equivalent_cycles"] for r in regions),
               expected, f"{backend} block total")
-    report = {
+    return {
         "regions": regions, "reference_clock_period_ps": period_ps,
         "full_run_totals": {
-            "block_latency_ns": totals["new_block_us_analytical"] * 1000,
-            "pim_latency_ns": totals["new_pim_us_analytical"] * 1000,
-            "reference_equivalent_cycles": totals["new_block_equivalent_cycles_analytical"],
+            "block_latency_ns": block_us * 1000,
+            "pim_latency_ns": pim_total * period_ns,
+            "reference_equivalent_cycles": block_us * 1000 / period_ns,
         },
     }
+
+
+def write_double_buffer_kernel_table(result, scenario, path, original=None):
+    report = build_double_buffer_report(result, scenario, original)
     write_kernel_table({f"{result['label']}_{scenario}": report}, path)
+    return report

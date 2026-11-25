@@ -27,9 +27,27 @@ class FP8OptimizationTests(unittest.TestCase):
         baseline = run_sim.calculate_acc_latency(SimpleNamespace(**common, pipelined_softmax=False), 30976, tp=2)
         pipelined = run_sim.calculate_acc_latency(SimpleNamespace(**common, pipelined_softmax=True), 30976, tp=2)
         self.assertEqual(run_sim.softmax_pipeline_startup_tokens(SimpleNamespace(**common)), 8192)
-        self.assertAlmostEqual(baseline["Softmax_latency"], 0.024492)
+        # FP8 defaults to a 32-lane PNM: 30976*32/32/32 = 968 groups x 25 cycles + 32 heads x 18.25.
+        self.assertEqual(run_sim.pnm_lanes(SimpleNamespace(**common)), 32)
+        self.assertAlmostEqual(baseline["Softmax_latency"], 0.012392)
         self.assertAlmostEqual(pipelined["Softmax_latency"], baseline["Softmax_latency"] * 8192 / 30976)
         self.assertEqual(baseline["SVReduction_latency"], pipelined["SVReduction_latency"])
+
+    def test_pnm_lanes_and_accelerators(self):
+        import run_sim
+        common = dict(model="Llama2-70B", precision="fp8", num_channels=32, num_banks=8,
+                      kv_head_tp=True, systolic_pim=True, systolic_dim=4, max_seq_len=32768,
+                      ewmul_pnm=True, flash_attention=True, flash_attention_block_size=2048,
+                      pipelined_softmax=False, parallel_sram=32)
+        legacy = run_sim.calculate_acc_latency(SimpleNamespace(**common, pnm_lanes=16), 30976, tp=2)
+        self.assertAlmostEqual(legacy["Softmax_latency"], 0.024492)
+        self.assertEqual(run_sim.pnm_lanes(SimpleNamespace(precision="bf16")), 16)
+        self.assertEqual(run_sim.pnm_accelerators(SimpleNamespace(**common)), 32)
+        # 64 accelerators share 32 SRAM ports: reads take 2 cycles (EXP 14, ADD/MUL 6).
+        wide = SimpleNamespace(**common, pnm_accelerators=64)
+        self.assertEqual(run_sim.pnm_cycles(wide), {"EXP": 14.0, "VEC_ADD": 6.0, "VEC_MUL": 6.0})
+        latency = run_sim.calculate_acc_latency(wide, 30976, tp=2)
+        self.assertAlmostEqual(latency["Softmax_latency"], (484 * 32 + 32 * 18.25) / 2e6)
 
 
 @unittest.skipUnless(BINARY.exists(), "build AiM to run channel concurrency integration tests")

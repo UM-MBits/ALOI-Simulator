@@ -741,25 +741,24 @@ class KVHeadTPTraceSchedulingTests(unittest.TestCase):
 
 
 class KVHeadTPCXLTests(unittest.TestCase):
-    def test_system_payload_is_four_collective_vectors(self):
-        main, helper, system = cxl_latency.kv_head_tp_pcie_bits(8192, 4)
-        self.assertEqual(main, 2 * 3 * 8192 * 16)
-        self.assertEqual(helper, 2 * 8192 * 16)
-        self.assertEqual(system, 4 * 3 * 8192 * 16)
-        self.assertEqual(system, main + 3 * helper)
+    def test_each_rank_sends_its_fp8_partial_to_every_peer_twice(self):
+        main, helper, system = cxl_latency.kv_head_tp_pcie_bits(8192, 4, precision="fp8")
+        self.assertEqual(main, 2 * 3 * 8192 * 8)
+        self.assertEqual(helper, main)
+        self.assertEqual(system, 4 * main)
 
     def test_tp1_has_no_cxl_collective(self):
-        self.assertEqual(cxl_latency.kv_head_tp_pcie_bits(4096, 1), (0, 0, 0))
-        self.assertEqual(cxl_latency.kv_head_tp_latency(4096, 18, 1, 16), 0.0)
+        self.assertEqual(cxl_latency.kv_head_tp_pcie_bits(4096, 1, precision="fp8"), (0, 0, 0))
+        self.assertEqual(cxl_latency.kv_head_tp_latency_ms(4096, 18, 1, 16, precision="fp8"), 0.0)
 
     def test_batch_payload_scales_only_the_two_hidden_vector_collectives(self):
         batch = 4
         dim = 8192
         tp = 4
         _main, _helper, system = cxl_latency.kv_head_tp_pcie_bits(
-            batch * dim, tp
+            batch * dim, tp, precision="fp8"
         )
-        self.assertEqual(system, 4 * (tp - 1) * batch * dim * 16)
+        self.assertEqual(system, 2 * tp * (tp - 1) * batch * dim * 8)
 
 
 class SystolicTPPNMEnergyTests(unittest.TestCase):

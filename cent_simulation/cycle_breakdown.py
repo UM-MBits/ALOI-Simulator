@@ -144,13 +144,17 @@ def formula_ledger(row, metadata=None):
     if integer(row, "Channels per block") != channels:
         raise ValueError("Representative KV-head TP requires one block per device")
 
+    # PNM vector width and accelerator count; rows predating these columns
+    # used 16 lanes and one accelerator per channel.
+    lanes = integer(row, "PNM lanes", 16)
+    accel = integer(row, "PNM accelerators", channels)
+    if min(lanes, accel) <= 0:
+        raise ValueError("PNM lanes and accelerators must be positive")
     sb_read, sb_write = calibration.SB_RD_CYCLE, calibration.SB_WR_CYCLE
-    vec = channels / ports * 2 * sb_read + 1 + sb_write
-    exp = channels / ports * sb_read + calibration.EXP_LANE_CYCLE + sb_write
+    vec = accel / ports * 2 * sb_read + 1 + sb_write
+    exp = accel / ports * sb_read + calibration.EXP_LANE_CYCLE + sb_write
     period_ns = 1e9 / calibration.FREQ
-    # PNM and TP partial vectors retain the legacy 16-element/BF16 model,
-    # even when the supplied physical PIM payload is FP8/32 elements.
-    one_norm = (8192 / 256 / channels * vec + 8192 / 16 / channels * vec * 3
+    one_norm = (8192 / (lanes * 16) / accel * vec + 8192 / lanes / accel * vec * 3
                 + sb_read + sb_write + 1 + calibration.RV_RMSNorm_CYCLE)
     q_dim, kv_dim, ffn_dim = 8192 // tp, 1024 // tp, 28672 // tp
     terms = {}
@@ -165,9 +169,9 @@ def formula_ledger(row, metadata=None):
     add("attention.rmsnorm", one_norm)
     add("ffn.rmsnorm", one_norm)
     for region, dim in (("aux.rope_q", q_dim), ("aux.rope_k", kv_dim)):
-        add(region, dim * calibration.RV_ROTEmbed_CYCLE_PIPELINE + dim / 16 / channels * vec)
+        add(region, dim * calibration.RV_ROTEmbed_CYCLE_PIPELINE + dim / lanes / accel * vec)
     local_heads = 64 // tp
-    softmax_full = (sequence * local_heads / 16 / channels * (exp + vec + 2 * vec)
+    softmax_full = (sequence * local_heads / lanes / accel * (exp + vec + 2 * vec)
                     + local_heads * sb_read + local_heads * calibration.RV_SFT_CYCLE_PIPELINE)
     exposure = number(row, "Softmax exposure factor", 1.0)
     if flag(row, "Pipelined softmax"):
@@ -176,14 +180,14 @@ def formula_ledger(row, metadata=None):
     elif exposure != 1:
         raise ValueError("Unpipelined Softmax requires exposure factor=1")
     add("aux.softmax", softmax_full * exposure, softmax_full)
-    add("aux.ffn_activation", ffn_dim / 16 / channels * 2 * vec)
+    add("aux.ffn_activation", ffn_dim / lanes / accel * 2 * vec)
     if flag(row, "Flash attention"):
         block = integer(row, "Flash attention block size")
         if block <= 0:
             raise ValueError("FlashAttention block size must be positive")
         if block * local_heads * 2 > integer(row, "Shared buffer capacity (bytes)"):
             raise ValueError("FlashAttention score block exceeds Shared Buffer capacity")
-        add("aux.flash_merge", sequence // block * local_heads / 16 / channels * vec)
+        add("aux.flash_merge", sequence // block * local_heads / lanes / accel * vec)
     reductions = (("q", "attention.q_projection", "Q reduction latency"),
                   ("kv", "attention.kv_projection", "KV reduction latency"),
                   ("sv", "attention.sv", "SV reduction latency"))
@@ -191,7 +195,7 @@ def formula_ledger(row, metadata=None):
         ns = number(row, column) * 1e6
         if metadata is not None:
             adds = metadata["pnm_reduction_adds"][key]
-            assert_close(math.ceil(adds / 16 / channels) * vec * period_ns * batch, ns, column)
+            assert_close(math.ceil(adds / lanes / accel) * vec * period_ns * batch, ns, column)
         terms[(region, "pnm")] = {
             "duration_ns": ns, "full_work_duration_ns": ns,
             "formula_cycles": ns / period_ns, "clock_period_ps": period_ns * 1000,
@@ -207,7 +211,7 @@ def formula_ledger(row, metadata=None):
     for region, column in (("aux.attention_residual", "Attention residual latency"),
                            ("aux.ffn_residual", "FFN residual latency")):
         if row.get(column) not in (None, ""):
-            add(region, 8192 / 16 / channels * vec)
+            add(region, 8192 / lanes / accel * vec)
             assert_close(terms[(region, "pnm")]["duration_ns"], number(row, column) * 1e6, column)
     pnm_ns = sum(t["duration_ns"] for (r, b), t in terms.items() if b == "pnm")
     assert_close(pnm_ns, number(row, "Acc latency") * 1e6, "PNM total")
@@ -224,7 +228,7 @@ def formula_ledger(row, metadata=None):
             "formula_cycles": None, "clock_period_ps": None,
         }
     assert_close(collective + handoff, number(row, "CXL latency") * 1e6, "CXL total")
-    return terms, {"pnm_clock_period_ps": period_ns * 1000, "vector_width": 16,
+    return terms, {"pnm_clock_period_ps": period_ns * 1000, "vector_width": lanes, "pnm_accelerators": accel,
                    "shared_buffer_read_cycles": sb_read, "shared_buffer_write_cycles": sb_write,
                    "vector_add_mul_cycles": vec, "exp_cycles": exp,
                    "rv_rmsnorm_cycles": calibration.RV_RMSNorm_CYCLE,
@@ -605,7 +609,8 @@ def analyze_case(row, *, log, timing, source_csv, trace=None, metadata_path=None
         "PNM/CXL retain legacy formulas; residual adds use the PNM VEC_ADD formula"
         if ("aux.attention_residual", "pnm") in formula else
         "PNM/CXL retain legacy formulas; residual EWADD arithmetic is unmodeled",
-        "FP8 PIM does not change the legacy 16-element PNM/BF16 partial-vector formulas",
+        "PNM vector width and accelerator count come from the source row (PNM lanes / PNM accelerators); "
+        "rows without them use 16 lanes and one accelerator per channel",
     ])
     regions = []
     for region_id, name, classification, members in CATALOG:
@@ -848,6 +853,7 @@ def render_summary(report):
         us = region["legacy_ledger_duration_ns"] / 1000
         percent = 100 * region["legacy_ledger_duration_ns"] / totals["block_latency_ns"]
         lines.append(f"{region['display_name']:<39} {values[0]:>13} {values[1]:>15} {values[2]:>15} {us:>14.6f} {percent:>9.2f}%")
+    lines.extend(render_kernel_cards(report))
     lines.extend(render_backend_details(report))
     lines.extend(render_issued_gap_details(report))
     lines.extend(["", "对账差额（ns）：" + json.dumps(report["reconciliation_residuals_ns"], sort_keys=True),
@@ -883,6 +889,43 @@ PIM_TABLE_COLUMNS = (
     ("Refresh", lambda c: c.startswith("REF")),
     ("Startup / Tail", lambda c: c in ("STARTUP", "TAIL")),
 )
+
+
+CARD_PIM_LABELS = ("MAC8", "WR_GB", "WR_MAC", "RD_MAC", "AF / RD_AF", "RD / WR",
+                   "ACT / PRE", "TMOD / CAS", "REF", "Startup / Tail")
+
+
+def _card_number(value):
+    value = float(value)
+    return f"{value:,.0f}" if abs(value - round(value)) < 1e-9 else f"{value:,.1f}"
+
+
+def render_kernel_cards(report, title="Kernel 明细"):
+    """One card per kernel: share of block, PIM/PNM/CXL cycles, PIM by command.
+
+    Cycles are reference-clock equivalent cycles; PIM command buckets use the
+    same grouping as the kernel CSV and sum to the kernel's PIM total.
+    """
+    block_ns = report["full_run_totals"]["block_latency_ns"]
+    lines = ["", f"===== {title}（等效周期，{report['reference_clock_period_ps']:g} ps）====="]
+    for region in report["regions"]:
+        if region["region_id"] == "aux.sync_control" or not region["legacy_ledger_duration_ns"]:
+            continue
+        terms = region["backends"]
+        share = 100 * region["legacy_ledger_duration_ns"] / block_ns
+        pim = terms["pim"]["reference_equivalent_cycles"]
+        lines += ["", f"{region['display_name']} ({share:.2f}%)",
+                  f"Total: {_card_number(region['reference_equivalent_cycles'])} cycles",
+                  f"PIM: {'unavailable' if pim is None else _card_number(pim) + ' cycles'}",
+                  f"PNM: {_card_number(terms['pnm']['reference_equivalent_cycles'] or 0)} cycles",
+                  f"CXL: {_card_number(terms['cxl']['reference_equivalent_cycles'] or 0)} cycles"]
+        commands = (region.get("pim_issued_gap_details") or {"commands": []})["commands"]
+        buckets = [(label, sum(c["gap_cycles"] for c in commands if match(c["command"])))
+                   for label, (_, match) in zip(CARD_PIM_LABELS, PIM_TABLE_COLUMNS)]
+        if any(cycles for _, cycles in buckets):
+            lines += ["", "PIM CYCLE"] + [f"{label}: {_card_number(cycles)} cycles"
+                                          for label, cycles in buckets if cycles]
+    return lines
 
 
 def write_kernel_table(reports, path):

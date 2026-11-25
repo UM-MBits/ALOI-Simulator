@@ -1017,7 +1017,7 @@ Equal objective values prefer the largest PP, then the smallest TP and replica.
 There are {len(candidates)} memory-specific candidates, {len(admitted)} admitted,
 {len(rejected)} rejected, and {len(underfilled)} admitted underfilled points.
 
-Each block has two row-parallel gather/reduce/broadcast phases, after WO and
+Each block has two row-parallel one-shot all-to-all all-reduces, after WO and
 W2. KV-head TP ranks are compute-symmetric, so one fresh rank trace represents
 every rank at a given model/context/TP point. The campaign contains 24
 simulations per memory timing and 72 Ramulator jobs across GDDR6, LPDDR4X
@@ -1045,8 +1045,8 @@ traces, for 48 functional traces total.
   trace commands. No `MAC_SBK` or bank-private GB is used.
 - PP and DP are post-processing. Pipeline fill, PRE_STBY waiting power, and the
   nearest integer DP neighbors around the DGX H100 power target are retained.
-- CXL traffic is two full-D gathers plus two full-D broadcasts per block,
-  totaling `4*(TP-1)*D` BF16 link values.
+- CXL traffic is two one-shot all-to-all all-reduces per block: every rank
+  sends its full-D FP8 partial to each of the TP-1 peers (`2*TP*(TP-1)*D` values).
 
 ## Files
 

@@ -8,13 +8,15 @@ import concurrent.futures
 import sys
 from pathlib import Path
 from cxl_latency import (
-    gpt_latency,
-    kv_head_tp_latency,
+    DEFAULT_PCIE_GEN,
+    PCIE_GB_PER_LANE,
+    cent_tp_latency_ms,
+    kv_head_tp_latency_ms,
     kv_head_tp_pcie_bits,
-    llama_latency,
-    vector_latency,
+    pp_handoff_latency_ms,
+    pp_handoff_pcie_bits,
 )
-from cent_power_calculator import DRAM_ENERGY_MODELS, ACCEL_CYCLE, SHARED_BUFFER_CAPACITY_BYTES, SRAM_IO_PARALLEL, add_energy_terms, kv_head_tp_pnm_dynamic_energy, power_calculator, command_processor, command_trace_prefix_for_log, set_channel_count, KILO, FREQ, SB_RD_CYCLE, SB_WR_CYCLE, RV_RMSNorm_CYCLE, RV_ROTEmbed_CYCLE_PIPELINE, RV_SFT_CYCLE_PIPELINE
+from cent_power_calculator import DRAM_ENERGY_MODELS, ACCEL_CYCLE, SHARED_BUFFER_CAPACITY_BYTES, SRAM_IO_PARALLEL, add_energy_terms, kv_head_tp_pnm_dynamic_energy, power_calculator, command_processor, command_trace_prefix_for_log, set_channel_count, KILO, FREQ, SB_RD_CYCLE, SB_WR_CYCLE, EXP_LANE_CYCLE, RV_RMSNorm_CYCLE, RV_ROTEmbed_CYCLE_PIPELINE, RV_SFT_CYCLE_PIPELINE
 from systolic_power import (
     SYSTOLIC_PIM_POWER_ASSUMPTION,
     SYSTOLIC_PIM_POWER_SCALING,
@@ -46,8 +48,25 @@ def get_args():
         default=int(SRAM_IO_PARALLEL),
         help="Independent 128-bit shared-buffer banks/ports (cent_dev default: 32)",
     )
+    parser.add_argument(
+        "--pnm-lanes",
+        dest="pnm_lanes",
+        type=int,
+        default=None,
+        help="Elements per PNM vector op (default: 256-bit datapath / element width = 32 for fp8, 16 for bf16)",
+    )
+    parser.add_argument(
+        "--pnm-accelerators",
+        dest="pnm_accelerators",
+        type=int,
+        default=None,
+        help="PNM vector accelerators per device sharing the shared buffer (default: one per channel)",
+    )
     parser.add_argument("--num_devices", type=int, help="Number of CXL devices", default=32)
     parser.add_argument("--PCIE_lanes", type=int, help="Number of PCIE lanes", default=144)
+    parser.add_argument("--pcie-gen", "--pcie_gen", dest="pcie_gen", type=int,
+                        choices=sorted(PCIE_GB_PER_LANE), default=DEFAULT_PCIE_GEN,
+                        help="PCIe generation for CXL links; per-lane GB/s: %s" % PCIE_GB_PER_LANE)
     parser.add_argument("--reuse_size", type=int, help="GB reuse size, depending on register number", default=32)
     parser.add_argument("--generate_trace_max_workers", type=int, help="maximum concurrent threads to generate traces, limited by memory", default=20)
     parser.add_argument("--run_simulation_max_workers", type=int, help="maximum concurrent threads to generate traces, limited by memory", default=4)
@@ -139,6 +158,10 @@ def get_args():
         parser.error("--batch-size must be positive")
     if args.parallel_sram < 1:
         parser.error("--parallel-sram must be positive")
+    if args.pnm_lanes is not None and args.pnm_lanes < 1:
+        parser.error("--pnm-lanes must be positive")
+    if args.pnm_accelerators is not None and args.pnm_accelerators < 1:
+        parser.error("--pnm-accelerators must be positive")
     if args.precision == "fp8":
         if not args.systolic_pim or not args.kv_head_tp:
             parser.error("--precision fp8 currently requires --systolic-pim and --kv-head-tp")
@@ -346,6 +369,39 @@ def ewmul_pnm_requested(args):
     """Return the user-requested EWMUL placement."""
 
     return bool(getattr(args, "ewmul_pnm", getattr(args, "EWMUL_PNM", False)))
+
+
+def pnm_lanes(args):
+    """Elements per PNM vector op: the 256-bit datapath holds 32 FP8 or 16 BF16."""
+    lanes = getattr(args, "pnm_lanes", None)
+    return int(lanes) if lanes else 256 // pim_geometry(args)["element_bits"]
+
+
+def pnm_accelerators(args):
+    """PNM vector accelerators per device (default: one per channel)."""
+    count = getattr(args, "pnm_accelerators", None)
+    return int(count) if count else int(args.num_channels)
+
+
+def pnm_cycles(args):
+    """Cycles of one PNM vector op; accelerators contend for the shared-buffer ports."""
+    ports = float(getattr(args, "parallel_sram", SRAM_IO_PARALLEL))
+    read = pnm_accelerators(args) / ports * SB_RD_CYCLE
+    return {
+        "EXP": read + EXP_LANE_CYCLE + SB_WR_CYCLE,
+        "VEC_ADD": 2.00 * read + 1.00 + SB_WR_CYCLE,
+        "VEC_MUL": 2.00 * read + 1.00 + SB_WR_CYCLE,
+    }
+
+
+def cxl_precision(args):
+    """CXL values travel at the simulation's element precision."""
+    return getattr(args, "precision", "bf16")
+
+
+def pcie_generation(args):
+    """PCIe generation for CXL links (older callers/namespaces default to 6)."""
+    return getattr(args, "pcie_gen", DEFAULT_PCIE_GEN)
 
 
 def ewmul_pnm_enabled(args):
@@ -742,24 +798,29 @@ def process_results(args):
 def calculate_acc_latency(args, seqlen, tp=1, device_role="main"):
     latency = {}
     geometry = pim_geometry(args)
+    # PNM vector work: ``lanes`` elements per op, spread over ``accel``
+    # accelerators that share the banked shared buffer (``cyc`` per op).
+    lanes = float(pnm_lanes(args))
+    accel = float(pnm_accelerators(args))
+    cyc = pnm_cycles(args)
     local_heads = n_heads[args.model] // tp if args.kv_head_tp else n_heads[args.model]
     local_hidden = embedding_size[args.model] // tp if args.kv_head_tp else embedding_size[args.model]
     local_kv_hidden = local_hidden // gqa_factor[args.model]
     local_ffn = ffn_size[args.model] // tp if args.kv_head_tp else ffn_size[args.model]
     rms_hidden = embedding_size[args.model]
-    latency["RMSNorm_latency"] = rms_hidden / 16.00 / 16.00 / args.num_channels * ACCEL_CYCLE["VEC_ADD"]
+    latency["RMSNorm_latency"] = rms_hidden / lanes / 16.00 / accel * cyc["VEC_ADD"]
     if ewmul_pnm_enabled(args):
         latency["RMSNorm_latency"] += (
-            rms_hidden / 16.00 / args.num_channels
-            * ACCEL_CYCLE["VEC_MUL"]
+            rms_hidden / lanes / accel
+            * cyc["VEC_MUL"]
             * 3.00
         )
     latency["RMSNorm_latency"] += SB_RD_CYCLE + SB_WR_CYCLE + 1.00
     latency["RMSNorm_latency"] += RV_RMSNorm_CYCLE
     latency["RMSNorm_latency"] = float(2.00 * latency["RMSNorm_latency"]) / float(FREQ / KILO)
-    latency["Softmax_latency"] = seqlen * local_heads / 16.00 / args.num_channels * ACCEL_CYCLE["EXP"]
-    latency["Softmax_latency"] += seqlen * local_heads / 16.00 / args.num_channels * ACCEL_CYCLE["VEC_ADD"]
-    latency["Softmax_latency"] += seqlen * local_heads / 16.00 / args.num_channels * ACCEL_CYCLE["VEC_MUL"] * 2.00
+    latency["Softmax_latency"] = seqlen * local_heads / lanes / accel * cyc["EXP"]
+    latency["Softmax_latency"] += seqlen * local_heads / lanes / accel * cyc["VEC_ADD"]
+    latency["Softmax_latency"] += seqlen * local_heads / lanes / accel * cyc["VEC_MUL"] * 2.00
     latency["Softmax_latency"] += local_heads * 1.00 * SB_RD_CYCLE
     latency["Softmax_latency"] += local_heads * RV_SFT_CYCLE_PIPELINE
     latency["Softmax_latency"] = float(latency["Softmax_latency"]) / float(FREQ / KILO)
@@ -779,8 +840,8 @@ def calculate_acc_latency(args, seqlen, tp=1, device_role="main"):
         # represented by the adjacent QK/SV trace commands.
         latency["FlashAttention_latency"] = (
             seqlen // args.flash_attention_block_size
-            * local_heads / 16.00 / args.num_channels
-            * ACCEL_CYCLE["VEC_ADD"]
+            * local_heads / lanes / accel
+            * cyc["VEC_ADD"]
             / float(FREQ / KILO)
         )
     latency["RotEmbed_latency"] = (
@@ -789,25 +850,25 @@ def calculate_acc_latency(args, seqlen, tp=1, device_role="main"):
     if ewmul_pnm_enabled(args):
         latency["RotEmbed_latency"] += (
             (local_hidden + local_kv_hidden)
-            / 16.00
-            / args.num_channels
-            * ACCEL_CYCLE["VEC_MUL"]
+            / lanes
+            / accel
+            * cyc["VEC_MUL"]
         )
         latency["EWMULActivation_latency"] = (
             local_ffn
-            / 16.00
-            / args.num_channels
+            / lanes
+            / accel
             * 2.00
-            * ACCEL_CYCLE["VEC_MUL"]
+            * cyc["VEC_MUL"]
             / float(FREQ / KILO)
         )
         # AiM treats ISR_EWADD as a no-op, so the two full-hidden residual
-        # adds run on the PNM 16-lane vector-add unit, like EWMUL above.
+        # adds run on the PNM vector-add unit, like EWMUL above.
         residual_add_latency = (
             rms_hidden
-            / 16.00
-            / args.num_channels
-            * ACCEL_CYCLE["VEC_ADD"]
+            / lanes
+            / accel
+            * cyc["VEC_ADD"]
             / float(FREQ / KILO)
         )
         latency["AttentionResidual_latency"] = residual_add_latency
@@ -845,19 +906,19 @@ def calculate_acc_latency(args, seqlen, tp=1, device_role="main"):
             reduction_work = systolic_layout.pnm_reduction_adds(seqlen)
             for name in ("q", "kv", "sv"):
                 groups_per_channel = math.ceil(
-                    reduction_work[name] / 16.0 / args.num_channels
+                    reduction_work[name] / lanes / accel
                 )
                 latency[f"{name.upper()}Reduction_latency"] = (
-                    groups_per_channel * ACCEL_CYCLE["VEC_ADD"]
+                    groups_per_channel * cyc["VEC_ADD"]
                 ) / float(FREQ / KILO)
         else:
             reduction_groups_per_channel = math.ceil(
                 layout.v_reduction_adds(seqlen)
-                / 16.0
-                / args.num_channels
+                / lanes
+                / accel
             )
             latency["SVReduction_latency"] = (
-                reduction_groups_per_channel * ACCEL_CYCLE["VEC_ADD"]
+                reduction_groups_per_channel * cyc["VEC_ADD"]
             ) / float(FREQ / KILO)
     else:
         latency["SVReduction_latency"] = 0.0
@@ -905,28 +966,30 @@ def load_data_point(args, seqlen, FC_devices, channels_per_block, PCIe_lanes_per
 
     if args.model_parallel:
         if args.kv_head_tp:
-            tp_collective_cxl_latency = kv_head_tp_latency(
+            tp_collective_cxl_latency = kv_head_tp_latency_ms(
                 embedding_size[args.model] * args.batch_size,
                 PCIe_lanes_per_device,
                 FC_devices,
                 args.num_devices,
+                pcie_gen=pcie_generation(args),
+                precision=cxl_precision(args),
             )
             pp_handoff_cxl_latency = (
-                vector_latency(
+                pp_handoff_latency_ms(
                     embedding_size[args.model] * args.batch_size,
                     PCIe_lanes_per_device,
+                    pcie_gen=pcie_generation(args),
+                    precision=cxl_precision(args),
                 )
                 if pp > 1
                 else 0.0
             )
             cxl_latency = tp_collective_cxl_latency + pp_handoff_cxl_latency
-        elif "Llama" in args.model:
-            cxl_latency = llama_latency([embedding_size[args.model] * args.batch_size, ffn_size[args.model] * args.batch_size], PCIe_lanes_per_device, FC_devices, args.num_devices)
         else:
-            cxl_latency = gpt_latency([embedding_size[args.model] * args.batch_size, ffn_size[args.model] * args.batch_size], PCIe_lanes_per_device, FC_devices, args.num_devices)
+            cxl_latency = cent_tp_latency_ms([embedding_size[args.model] * args.batch_size, ffn_size[args.model] * args.batch_size], PCIe_lanes_per_device, FC_devices, args.num_devices, pcie_gen=pcie_generation(args), precision=cxl_precision(args))
         embedding_latency_data = 0.00 if args.decode_only else embedding_latency['model_parallel'][FC_devices]
     else:
-        cxl_latency = vector_latency(embedding_size[args.model] * args.batch_size, PCIe_lanes_per_device)
+        cxl_latency = pp_handoff_latency_ms(embedding_size[args.model] * args.batch_size, PCIe_lanes_per_device, pcie_gen=pcie_generation(args), precision=cxl_precision(args))
         embedding_latency_data = 0.00 if args.decode_only else embedding_latency['pipeline_parallel'][channels_per_block]
     if not args.kv_head_tp:
         tp_collective_cxl_latency = 0.0
@@ -999,14 +1062,15 @@ def load_data_point(args, seqlen, FC_devices, channels_per_block, PCIe_lanes_per
     energy_token = {}
     if args.kv_head_tp:
         main_PCIE, helper_PCIE, system_PCIE = kv_head_tp_pcie_bits(
-            embedding_size[args.model] * args.batch_size, FC_devices
+            embedding_size[args.model] * args.batch_size, FC_devices, precision=cxl_precision(args)
         )
         tp_collective_PCIE = system_PCIE
         pp_handoff_PCIE = (
-            embedding_size[args.model] * args.batch_size * 16 if pp > 1 else 0
+            pp_handoff_pcie_bits(embedding_size[args.model] * args.batch_size, precision=cxl_precision(args))
+            if pp > 1 else 0
         )
         # Charge the one source-side pipeline transfer once per TP group.  TP
-        # helper ranks retain only their two all-reduce broadcast shares.
+        # helper ranks retain only their two all-reduce shares.
         main_PCIE += pp_handoff_PCIE
         system_PCIE += pp_handoff_PCIE
         local_heads = n_heads[args.model] // FC_devices
@@ -1157,6 +1221,10 @@ def load_data_point(args, seqlen, FC_devices, channels_per_block, PCIe_lanes_per
         ),
         'Pipelined softmax': getattr(args, 'pipelined_softmax', False),
         'Channel concurrency': getattr(args, 'channel_concurrency', False),
+        'PCIe generation': pcie_generation(args),
+        'PCIe lanes per device': PCIe_lanes_per_device,
+        'PNM lanes': pnm_lanes(args),
+        'PNM accelerators': pnm_accelerators(args),
         'Softmax pipeline startup tokens': softmax_pipeline_startup_tokens(args),
         'Softmax exposure factor': softmax_pipeline_factor,
         'Parallel SRAM banks': getattr(
@@ -1229,6 +1297,16 @@ def update_csv(args, seqlen_list):
             results_df['DRAM energy model'] = 'legacy'
         if 'Channel concurrency' not in results_df.columns:
             results_df['Channel concurrency'] = False
+        if 'PCIe generation' not in results_df.columns:
+            results_df['PCIe generation'] = DEFAULT_PCIE_GEN
+        # Rows predating these columns used 16-lane PNM, one accelerator per channel.
+        # Older rows came from --PCIE_lanes 144 split across all devices.
+        if 'PCIe lanes per device' not in results_df.columns:
+            results_df['PCIe lanes per device'] = 144 // results_df['Device number']
+        if 'PNM lanes' not in results_df.columns:
+            results_df['PNM lanes'] = 16
+        if 'PNM accelerators' not in results_df.columns:
+            results_df['PNM accelerators'] = results_df['Channels per device']
         if 'Precision' not in results_df.columns:
             results_df['Precision'] = 'BF16'
         if 'PIM element bits' not in results_df.columns:
@@ -1339,7 +1417,9 @@ def update_csv(args, seqlen_list):
     # The SRAM organization is a hardware revision, not an additional sweep
     # dimension.  Reprocessing an existing workload therefore replaces its
     # legacy single-port result with the current banked-SRAM result.
-    results_df = results_df.drop_duplicates(subset=['Model', 'Precision', 'Device number', 'Pipeline parallelism', 'Tensor parallelism', 'Batch size', 'Systolic pim', 'Systolic dim', 'EWMUL PNM effective', 'EWMUL PNM provenance', 'Flash attention', 'Flash attention block size', 'Pipelined softmax', 'Channel concurrency', 'Channels per device', 'Banks per device', 'Channels per block', 'Sequence length', 'Context window', 'Attention mapping', 'DRAM energy model'], keep='last')
+    for column in ('PCIe generation', 'PCIe lanes per device', 'PNM lanes', 'PNM accelerators'):
+        results_df[column] = results_df[column].astype(int)
+    results_df = results_df.drop_duplicates(subset=['Model', 'Precision', 'Device number', 'Pipeline parallelism', 'Tensor parallelism', 'Batch size', 'Systolic pim', 'Systolic dim', 'EWMUL PNM effective', 'EWMUL PNM provenance', 'Flash attention', 'Flash attention block size', 'Pipelined softmax', 'Channel concurrency', 'PCIe generation', 'PCIe lanes per device', 'PNM lanes', 'PNM accelerators', 'Channels per device', 'Banks per device', 'Channels per block', 'Sequence length', 'Context window', 'Attention mapping', 'DRAM energy model'], keep='last')
     results_df = results_df.sort_values(by=['Model', 'Precision', 'Device number', 'Pipeline parallelism', 'Tensor parallelism', 'Batch size', 'Systolic pim', 'Systolic dim', 'EWMUL PNM provenance', 'EWMUL PNM effective', 'Flash attention', 'Flash attention block size', 'Pipelined softmax', 'Parallel SRAM banks', 'Channels per device', 'Banks per device', 'Channels per block', 'Context window', 'Sequence length', 'DRAM energy model'])
     results_df.to_csv(args.simulation_result_path, index=False)
     # print(results_df)
@@ -1388,6 +1468,9 @@ def process_throughputs(args):
     
     for column, expected in {
         'Channel concurrency': getattr(args, 'channel_concurrency', False),
+        'PCIe generation': pcie_generation(args),
+        'PNM lanes': pnm_lanes(args),
+        'PNM accelerators': pnm_accelerators(args),
         'Flash attention': getattr(args, 'flash_attention', False),
         'Flash attention block size': args.flash_attention_block_size if args.flash_attention else 0,
     }.items():

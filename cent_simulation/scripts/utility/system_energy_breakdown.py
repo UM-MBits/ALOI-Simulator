@@ -187,11 +187,12 @@ def _kv_head_energy(
     channel_count = int(source["Channels per device"])
     local_heads = n_heads[model] // tp
     local_hidden = embedding_size[model] // tp
+    precision = str(source.get("Precision", "BF16")).lower()
     main_pcie, helper_pcie, _system_pcie = simulator.kv_head_tp_pcie_bits(
-        embedding_size[model] * batch_size, tp
+        embedding_size[model] * batch_size, tp, precision=precision
     )
     if source_pp > 1:
-        main_pcie += embedding_size[model] * batch_size * 16
+        main_pcie += simulator.pp_handoff_pcie_bits(embedding_size[model] * batch_size, precision=precision)
     calc_args = dict(
         dram_power_impl=dram_impl,
         dram_energy_model=str(source["DRAM energy model"]),

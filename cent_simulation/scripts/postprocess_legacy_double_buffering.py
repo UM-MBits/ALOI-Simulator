@@ -168,7 +168,9 @@ def render(cases):
         f"Context window: {c['context_window']}; evaluated decode sequence length: {c['sequence_length']}.",
         f"Flash chunk: {c['flash_attention_block_size']}; pipelined softmax and channel concurrency enabled.",
         "CXL: O/Down TP collectives and PP handoff included; separation changes presentation only.",
-        (f"CXL bandwidth unit: {c['cxl_bandwidth_model'].get('unit', 'GiB/s')}; "
+        (f"CXL model: {c['cxl_bandwidth_model'].get('cxl_model', 'legacy')}; "
+         f"PCIe {c['cxl_bandwidth_model'].get('pcie_generation', 6)}; "
+         f"CXL bandwidth unit: {c['cxl_bandwidth_model'].get('unit', 'GB/s')}; "
          "single/double-buffer comparison uses the same units; original source values are preserved in analysis.json."),
         "", "Formula (same as run_sim.load_data_point):",
         "  token_latency_ms = block_us * layers / 1000  (decode-only)",
@@ -190,10 +192,10 @@ def render(cases):
                          f"{r['tokens_per_s_per_device']:>13.6f} {r['throughput_gain_percent']:>8.4f}")
     lines += ["", "Scope and validation:",
               "- Throughput assumes steady-state full PP occupancy. Batch=4 is per microbatch, not four sequences total.",
-              "- With only one batch=4 group in flight, divide the reported system/device throughput by PP=16.",
+              f"- With only one batch={c['batch_size']} group in flight, divide the reported system/device throughput by PP={c['pp']}.",
               "- Decode Transformer blocks only: embedding, output head, CPU sampling and pipeline fill/drain are excluded.",
-              "- This is the sequence-length=30976 point, not a context-length average.",
-              "- PNM/softmax exposure stay at source values. CXL uses the selected bandwidth units, retaining the existing per-block PP handoff charge.",
+              f"- This is the sequence-length={c['sequence_length']} point, not a context-length average.",
+              "- PNM/softmax exposure stay at source values. CXL uses the selected PCIe generation, retaining the per-block PP handoff charge.",
               "- dependency_aware is the main analytical result; ideal_ready_inputs is an optimistic readiness sensitivity.",
               "- Original source throughput/latency reproduced; CXL-separated totals and device normalization checked.",
               "- No new Ramulator run, power estimate, or energy estimate is implied."]

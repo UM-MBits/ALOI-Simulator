@@ -10,13 +10,15 @@ import matplotlib.pyplot as plt
 # Add the directory to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', 'simulator_python')))
 
-from cxl_latency import llama_latency, gpt_latency, vector_latency
+from cxl_latency import DEFAULT_PCIE_GEN, PCIE_GB_PER_LANE, cent_tp_latency_ms, pp_handoff_latency_ms
 from cent_power_calculator import DRAM_POWER, ACCEL_CYCLE, ACCEL_POWER, SRAM_POWER, CTRL_POWER, commands, isrs, power_calculator, command_processor
 
 def get_args():
     parser = argparse.ArgumentParser('run_scripts.py')
     parser.add_argument("--num_channels", type=int, help="Number of channels per device", default=32)
     parser.add_argument("--num_devices", type=int, help="Number of CXL devices")
+    parser.add_argument("--pcie-gen", dest="pcie_gen", type=int, choices=sorted(PCIE_GB_PER_LANE),
+                        default=DEFAULT_PCIE_GEN, help="PCIe generation for CXL links")
     parser.add_argument("--reuse_size", type=int, help="GB reuse size, depending on register number", default=32)
     parser.add_argument("--generate_trace_max_workers", type=int, help="maximum concurrent threads to generate traces, limited by memory", default=16)
     parser.add_argument("--seqlen", type=int, help="sequence length, using prompt + generation / 2", default=2048)
@@ -146,7 +148,7 @@ def update_csv(args, device_list):
                 path = f"../trace/{args.num_channels}_channels_per_device/pipeline_parallel/{args.model}/trace_{channels_per_block}_channels_per_block_seqlen_{args.seqlen}.txt.log"
                 stats = command_processor(path)
                 pim_latency = stats["latency"]
-                cxl_latency = vector_latency(embedding_size[args.model], PCIe_lanes)
+                cxl_latency = pp_handoff_latency_ms(embedding_size[args.model], PCIe_lanes, args.pcie_gen, precision="bf16")  # CENT BF16
                 acc_latency_dict = calculate_acc_latency(args)
                 acc_latency = (acc_latency_dict["RMSNorm_latency"] + acc_latency_dict["Softmax_latency"] + acc_latency_dict["RotEmbed_latency"]) * blocks_per_device
                 transformer_block_latency = pim_latency + cxl_latency + acc_latency
@@ -175,7 +177,7 @@ def update_csv(args, device_list):
                 path = f"../trace/{args.num_channels}_channels_per_device/model_parallel/{args.model}/trace_{devices_per_pp}_FC_devices.txt.log"
                 stats = command_processor(path)
                 pim_latency = stats["latency"]
-                cxl_latency = llama_latency([embedding_size[args.model], ffn_size[args.model]], PCIe_lanes, devices_per_pp, devices_per_pp)
+                cxl_latency = cent_tp_latency_ms([embedding_size[args.model], ffn_size[args.model]], PCIe_lanes, devices_per_pp, devices_per_pp, args.pcie_gen, precision="bf16")
                 acc_latency_dict = calculate_acc_latency(args)
                 acc_latency = (acc_latency_dict["RMSNorm_latency"] + acc_latency_dict["Softmax_latency"] + acc_latency_dict["RotEmbed_latency"])
                 transformer_block_latency = pim_latency + cxl_latency + acc_latency

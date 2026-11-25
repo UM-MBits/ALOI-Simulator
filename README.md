@@ -6,45 +6,54 @@ This repository provides the following artifact required for the evaluation of *
 <img src="CENT.png" alt="CENT" width="80%">
 </p>
 
-## Current implementation and reference results
+## Current implementation and SOTA results
 
-The performance results currently use the **legacy trace-driven simulation
-framework**: Python generates AiM traces, the C++ AiM/Ramulator backend models
-PIM timing, and Python adds analytical PNM/CXL latency and energy. The planned
-ALOI compiler/command DAG and new functional + cycle-level simulation engine
-are not the implementation behind these results.
+The performance results use the **legacy trace-driven simulation framework**:
+Python generates AiM traces, the C++ AiM/Ramulator backend models PIM timing,
+and Python adds analytical PNM/CXL latency and energy. The planned ALOI
+compiler/command DAG and new functional + cycle-level simulation engine are not
+the implementation behind these results.
 
-The committed single-buffer reference is
-[`cent_simulation/output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4`](cent_simulation/output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4/README.md).
-It contains one baseline and one fully optimized run of **Llama2-70B, FP8,
-SA4×32, TP2, batch4**, with a **32,768-token window and 30,976 active tokens**.
-Both use LPDDR4 **32 channels × x16, prefetch16, nBL=8, nCCD=2, 625 ps/clock**.
+The current SOTA configuration is **Llama2-70B, FP8, SA4×32, batch4**, evaluated at
+8K (TP1×PP8), 16K (TP1×PP8), 32K (TP2×PP8) and 64K (TP4×PP4)
+windows, LPDDR4 **32 channels × x16,
+prefetch16, nBL=8, nCCD=2, 625 ps/clock**, with all four optimizations on
+(EWMUL_PNM, FlashAttention, pipelined Softmax, channel concurrency).
+See [SOTA_RESULTS.md](SOTA_RESULTS.md) for the method, CXL model, reproduction
+commands and per-kernel results. Results live (gitignored) under
+`cent_simulation/output/sota_results/` (one folder per case).
 
-| Retained single-buffer result | Optimizations | PIM cycles | Block latency (µs) |
-| --- | --- | ---: | ---: |
-| [Baseline](cent_simulation/output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4/baseline/summary.txt) | EWMUL_PNM ON; FlashAttention, pipelined Softmax, and channel concurrency OFF | 713,214 | 576.119736 |
-| [Full](cent_simulation/output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4/full/summary.txt) | All four ON; FlashAttention block size 1024 | 564,405 | 411.070003 |
+| Context | Parallelism | FlashAttention block | PCIe | Single-buffer block (µs) | Double-buffer block (µs) | tokens/s/device (single → double) | Double-buffer mJ/token | Double-buffer tokens/J | Double-buffer W/device |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8K | TP1 × PP8 | 2048 | 5.0 | 403.475 | 332.039 | 123.92 → 150.58 | 165.27 | 6.051 | 24.89 |
+| 8K | TP1 × PP8 | 2048 | 7.0 | 401.423 | 329.987 | 124.56 → 151.52 | 165.27 | 6.051 | 25.04 |
+| 16K | TP1 × PP8 | 2048 | 5.0 | 469.835 | 388.159 | 106.42 → 128.81 | 194.63 | 5.138 | 25.07 |
+| 16K | TP1 × PP8 | 2048 | 7.0 | 467.783 | 386.107 | 106.89 → 129.50 | 194.63 | 5.138 | 25.20 |
+| 32K | TP2 × PP8 | 2048 | 5.0 | 321.046 | 267.929 | 77.87 → 93.31 | 258.75 | 3.865 | 24.14 |
+| 32K | TP2 × PP8 | 2048 | 7.0 | 314.890 | 261.773 | 79.39 → 95.50 | 258.75 | 3.865 | 24.71 |
+| 64K | TP4 × PP4 | 4096 | 5.0 | 240.693 | 204.476 | 51.93 → 61.13 | 381.19 | 2.623 | 23.30 |
+| 64K | TP4 × PP4 | 4096 | 7.0 | 226.329 | 190.112 | 55.23 → 65.75 | 381.19 | 2.623 | 25.06 |
+
+Single-buffer PIM is simulated; double buffering is an analytical estimate on
+that run. PNM uses 32 lanes (FP8) × 32 accelerators per device; every device
+has 4 PCIe lanes. The FlashAttention block is chosen so one QK wave fills all
+32 lanes (TP1/TP2: 2048, TP4: 4096); a 64K block-2048 control is kept.
 
 These are per-block, per-batch-group results on one representative TP rank.
-The archived numbers and source hashes describe the retained original runs;
-they have not been regenerated after merging the remote phase-checkpoint and
-analysis updates or the active-queue fence fix.
-The [combined summary](cent_simulation/output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4/summary.txt)
-includes every kernel's PIM/PNM/CXL contributions, command counts, and command
-gap details. PIM kernel gaps include waits; they are attribution estimates,
-not isolated arithmetic timings. **These archived results do not charge
-Residual/EWADD arithmetic.** New EWMUL_PNM runs charge both residual adds to the
-PNM VEC_ADD unit, because AiM `ISR_EWADD` is a no-op. Softmax overlap and
-PNM/CXL retain legacy formulas.
 
-The `main` branch uses the single-buffer `AiM` profile. The `double-buffering`
-branch additionally implements the opt-in `AiMAsync`
-two-GB execution profile, selected by `--pim-double-buffering`. The reference
-directory above uses the single-buffer `AiM` profile. See the separate
-[double-buffer comparison](https://github.com/Linus-Wangjz/ALOI/blob/double-buffering/cent_simulation/results/double_buffering_fp8_32k_batch4/summary.txt)
-for that branch's results and ablations. New performance runs should explicitly
-enable the four default optimizations documented below; double buffering is a
-separate hardware profile.
+**CXL** ([`cent_simulation/cxl_latency.py`](cent_simulation/cxl_latency.py)) is
+one model everywhere: one-shot all-to-all TP all-reduce, unicast (no multicast
+discount), values on the wire at the simulation precision (FP8 1 B, BF16 2 B)
+with 192 B payload per 256 B flit, GB/s per lane per
+direction set by `--pcie-gen {5,6,7}` (4/8/16), and a 180 ns fixed overhead per
+transfer (4 CXL ports, 2 PCIe PHY traversals, 1 switch).
+
+Double buffering here is an analytical estimate on the simulated single-buffer
+run. The `double-buffering` branch additionally implements the opt-in `AiMAsync`
+two-GB execution profile, selected by `--pim-double-buffering`; see its
+[double-buffer comparison](https://github.com/Linus-Wangjz/ALOI/blob/double-buffering/cent_simulation/results/double_buffering_fp8_32k_batch4/summary.txt).
+New performance runs should explicitly enable the four default optimizations
+documented below.
 
 ## Dependencies
 
@@ -122,7 +131,7 @@ fully optimized variant:
 
 ```bash
 cd cent_simulation
-python3 scripts/run_legacy_optimization_case.py --variants full
+python3 scripts/run_sota_results.py --variants full
 cd ..
 ```
 
@@ -224,66 +233,29 @@ python -m unittest discover -s tests -v
 ```
 
 When explicitly requested to compare a baseline and ablations for FP8 TP2/batch4,
-build AiM and run all four variants:
+build AiM and run the extra variants into a separate output root:
 
 ```bash
 cd cent_simulation
-python scripts/run_legacy_optimization_case.py --variants baseline parallel flash full
+python scripts/run_sota_results.py --variants baseline parallel flash full full_flash1024 \
+  --output-root output/<ablation_root> --trace-root trace/<ablation_root>
 ```
 
-The retained TP2/batch4 comparison contains one `baseline` run and one `full`
-run. Its stable reports are
-`output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4/baseline/summary.txt`
-and `full/summary.txt` in the same directory. The top-level `summary.txt`
-embeds both complete kernel reports: PIM/PNM/CXL cycle conversions, raw
-issued-command counts, grouped command costs, and MAC gap histograms.
 The baseline disables FlashAttention, pipelined Softmax, and channel concurrency;
 **EWMUL_PNM stays enabled because systolic PIM forces it on.** It must not be
-described as an all-four-off run.
+described as an all-four-off run. Trace/log directories include a build/input
+fingerprint (including `cxl_latency.py` and the PCIe generation), so a changed
+backend, generator or CXL model does not reuse incompatible simulation logs.
+Each run saves its source and binary SHA256 records in `BUILD_MANIFEST.json`.
+One output root holds one PCIe generation.
 
-The current LPDDR4 results use **32 channels × x16, prefetch16, 32-byte
-transactions, and nBL=8 clocks** at 625 ps/clock; internal PIM MAC spacing stays
-nCCD=2. The previous width32/prefetch8/nBL4 model provided twice the intended
-external bandwidth. Both retained runs have been rerun with the corrected
-interface and byte-identical host traces:
-
-| Variant | Previous PIM cycles | Corrected PIM cycles | Previous block (µs) | Corrected block (µs) | Latency increase |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline (EWMUL_PNM ON) | 653,953 | 713,214 | 539.081611 | 576.119736 | 6.87% |
-| Full optimizations | 493,540 | 564,405 | 366.779378 | 411.070003 | 12.08% |
-
-Full optimizations retain a 28.65% block-latency reduction versus the corrected
-baseline. The root summary includes before/after totals and every kernel's
-change; `interface_correction_comparison.csv` and `kernel_interface_correction.csv`
-provide machine-readable comparisons. `interface_correction_reference.json`
-preserves the superseded metrics and source hashes. Resolved timing sidecars
-now export the organization as well as timings, and every new kernel report
-states its actual interface. PNM/CXL and pipelined Softmax remain legacy
-analytical formulas. The separate archived FP8 campaign remains a historical
-record of the former interface model.
-
-To reproduce the requested pair, use `--variants baseline full` (also the
-comparison script's default). To keep only the indexed pair without running
-the simulator, use:
-
-```bash
-cd cent_simulation
-python scripts/run_legacy_optimization_case.py --retain-only
-```
-
-Retention validates both results and their raw input SHA256 values before
-removing redundant builds and ablations within this experiment. Add
-`--clean-legacy-v00` to remove the duplicate legacy_v0.0 TP2/batch4 reports too.
-
-The explicit four-variant command creates isolated baseline, channel-concurrent, FlashAttention, and combined
-runs under `output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4`. The combined
-case enables `--EWMUL_PNM --flash-attention --pipelined-softmax
---channel-concurrency`. Each report includes issued-command gap details; the
-root `summary.txt` compares block latency and Score Transfer. FP8 uses a 4x32
-array and an 8192-token Softmax startup window; PNM retains 16-lane formulas.
-Trace/log directories include a build/input fingerprint, so a changed backend
-or generator does not reuse incompatible simulation logs. Each run saves its
-source and binary SHA256 records in `BUILD_MANIFEST.json`.
+LPDDR4 results use **32 channels × x16, prefetch16, 32-byte transactions, and
+nBL=8 clocks** at 625 ps/clock; internal PIM MAC spacing stays nCCD=2.
+FP8 uses a 4x32 array and an 8192-token Softmax startup window. PNM vector
+ops are one 256-bit word wide: 32 lanes for FP8, 16 for BF16 (`--pnm-lanes`).
+`--pnm-accelerators` sets the PNM accelerators per device (default: one per
+channel); they share `--parallel-sram` shared-buffer ports, so each read takes
+accelerators / ports cycles.
 
 Concurrent mode sets frontend `issue_width=32` and memory `host_issue_width=32`.
 Every channel accepts at most one request per cycle, including expanded WR_GB

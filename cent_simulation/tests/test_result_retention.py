@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import run_legacy_optimization_case as runner  # noqa: E402
+import run_sota_results as runner  # noqa: E402
 
 
 class RetentionTests(unittest.TestCase):

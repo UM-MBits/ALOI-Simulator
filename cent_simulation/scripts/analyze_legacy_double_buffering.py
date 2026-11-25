@@ -4,7 +4,8 @@
 This does not run Ramulator, alter its command counts, or predict energy.
 Each load can overlap only the immediately preceding compute wave: two GBs,
 one current operand and one prefetched operand. PIM/PNM non-WRGB costs stay
-fixed; CXL bandwidth units are explicit for the single/double-buffer comparison.
+fixed; CXL (cxl_latency, optionally rebased to another PCIe generation) is identical
+in the single/double-buffer comparison.
 """
 
 from __future__ import annotations
@@ -19,12 +20,13 @@ import math
 from pathlib import Path
 import sys
 
-from legacy_cxl_units import apply_cxl_units
-from double_buffer_kernel_table import write_double_buffer_kernel_table
+from cxl_rebase import apply_pcie_generation
+from cxl_latency import PCIE_GB_PER_LANE
+from double_buffer_kernel_table import build_double_buffer_report, render_kernel_cards, write_double_buffer_kernel_table
 
 
 REPO = Path(__file__).resolve().parents[2]
-ROOT = REPO / "cent_simulation/output/legacy_optimizations/LPDDR4_nCCD2_TP2_32K_batch4_flash2048_pnm_residual"
+ROOT = REPO / "cent_simulation/output/sota_results/LPDDR4_nCCD2_TP2_PP8_32K_batch4_flash2048_pnm_residual"
 REGIONS = {
     "q": "attention.q_projection", "fused_kv": "attention.kv_projection",
     "qk": "attention.qk", "sv_paired_kv_heads": "attention.sv",
@@ -325,7 +327,7 @@ ASSUMPTIONS = [
     "Accounting v2: nominal H_i selects the overlapped prefix. Credit each overlapped burst by min(overlapped nominal time, its actual WRGB-owned issue gap). Never subtract nominal time directly from a different issued-gap ledger.",
     "T_new = saved T_old - sum(credited WRGB gaps). Each kernel's remaining WRGB gap is nonnegative. CASWRGB is excluded from the deduction budget; all non-WRGB costs remain fixed.",
     "Two separate identities: nominal wire = nominal hidden + nominal exposed; old WRGB issue gaps = credited hidden + remaining WRGB gaps. The exposed_wrgb_cycles field is the latter ledger remainder, not nominal bus time.",
-    "PNM, CXL and legacy Softmax exposed time stay exactly as in each source. This does not recompute overlap, refresh schedule, contention, energy or device throughput.",
+    "PNM, CXL and Softmax exposed time stay exactly as in each source. This does not recompute overlap, refresh schedule, contention, energy or device throughput.",
     "All source GB writes, Q reloads, array mappings and simplified legacy RD_MAC counts are retained. No Q-residency or proposed same-V dual-SA optimization is added.",
     "Results describe one representative TP rank, one Transformer block, one batch group. Do not multiply latency by 32 channels or by TP.",
     "Raw issued gaps contain waiting and are not independent service times. A cycle-accurate implementation may realize a different saving.",
@@ -372,19 +374,25 @@ def render_summary(result):
     return "\n".join(lines) + "\n"
 
 
-def analyze(source_path, label, output, search_root, cxl_bandwidth_unit="GB/s"):
+def analyze(source_path, label, output, search_root, pcie_gen=None):
     source = json.loads(Path(source_path).read_text())
     case = source["case"]
-    if (case["model"], case["tp"], case["batch_size"], case["array_height"], case["array_width"],
+    if (case["model"], case["array_height"], case["array_width"],
             case["nBL"], case["nCCD"], case["flash_attention"], case["channel_concurrency"]) != (
-            "Llama2-70B", 2, 4, 4, 32, 8, 2, True, True):
-        raise ValueError("This analytical readiness policy is scoped to the retained full FP8 SA4x32 TP2 batch4 case")
+            "Llama2-70B", 4, 32, 8, 2, True, True):
+        raise ValueError("This analytical readiness policy is scoped to full FP8 SA4x32 KV-head TP runs "
+                         "(FlashAttention and channel concurrency on, LPDDR4 nBL8/nCCD2)")
     artifacts = source["run_identity"]["artifacts"]
     trace = resolve_artifact(artifacts["trace"], search_root)
     metadata_path = resolve_artifact(artifacts["systolic_metadata"], search_root)
     issued_path = resolve_artifact(artifacts["issued_command_trace"],
-                                   REPO / "cent_simulation/output/legacy_optimizations")
+                                   REPO / "cent_simulation/output/sota_results")
     metadata = json.loads(metadata_path.read_text())
+    # The readiness policy names these kernels; other SV packings (e.g. TP8's
+    # context shards) have different producer/consumer structure.
+    unknown = {p["kernel"] for p in metadata["command_phases"]} - set(REGIONS)
+    if unknown:
+        raise ValueError(f"Readiness policy does not cover kernels {sorted(unknown)}")
     waves, counts = decode_waves(trace, metadata, source["estimator"]["reference_channel"])
     validate_counts(source, metadata, counts)
     wave_gaps = issued_wrgb_gaps(waves, issued_path, source["estimator"]["reference_channel"])
@@ -406,15 +414,20 @@ def analyze(source_path, label, output, search_root, cxl_bandwidth_unit="GB/s"):
                              "all_remaining_WRGB_gap_budgets_nonnegative": True,
                              "CASWRGB_and_all_non_WRGB_PIM_costs_unchanged": True},
               "models": models}
-    apply_cxl_units(result, source["run_identity"]["source_row"], metadata["shape"], cxl_bandwidth_unit)
-    result["provenance"]["cxl_unit_postprocessor"] = describe(Path(__file__).with_name("legacy_cxl_units.py"))
+    apply_pcie_generation(result, source["run_identity"]["source_row"], metadata["shape"], pcie_gen)
+    result["provenance"]["cxl_rebase"] = describe(Path(__file__).with_name("cxl_rebase.py"))
     result["provenance"]["kernel_csv_renderer"] = describe(Path(__file__).with_name("double_buffer_kernel_table.py"))
     output.mkdir(parents=True, exist_ok=True)
     (output / "analysis.json").write_text(json.dumps(result, indent=2) + "\n")
-    (output / "summary.txt").write_text(render_summary(result))
     for name, model in models.items():
         write_double_buffer_kernel_table(result, name, output / f"{name}_kernels.csv", source)
         write_csv(output / f"{name}_waves.csv", model["waves"])
+    pcie = result["cxl_bandwidth_model"]["pcie_generation"]
+    cards = []
+    for scenario, title in (("single_buffer", f"单缓冲 kernel 明细（PCIe {pcie}）"),
+                            ("dependency_aware", f"Double buffering（dependency_aware）kernel 明细（PCIe {pcie}）")):
+        cards += render_kernel_cards(build_double_buffer_report(result, scenario, source), title)
+    (output / "summary.txt").write_text(render_summary(result) + "\n".join(cards) + "\n")
     return result
 
 
@@ -443,22 +456,25 @@ def plot_results(results, path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=ROOT / "full/breakdown.json")
-    parser.add_argument("--supplement-source", type=Path, default=ROOT / "full_flash1024/breakdown.json")
-    parser.add_argument("--skip-supplement", action="store_true")
-    parser.add_argument("--trace-search-root", type=Path, default=REPO / "cent_simulation/trace/legacy_optimizations")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "double buffering")
+    parser.add_argument("--supplement-source", type=Path,
+                        help="optional second report with a different FlashAttention block size")
+    parser.add_argument("--trace-search-root", type=Path, default=REPO / "cent_simulation/trace/sota_results")
+    parser.add_argument("--output-dir", type=Path,
+                        help="default: <root>/double buffering, or <root>/double buffering pcie<N> with --pcie-gen")
     parser.add_argument("--plot", action="store_true")
-    parser.add_argument("--cxl-bandwidth-unit", choices=("GB/s", "GiB/s"), default="GB/s",
-                        help="GB/s uses decimal bandwidth; GiB/s reproduces the saved legacy CXL units")
+    parser.add_argument("--pcie-gen", type=int, choices=sorted(PCIE_GB_PER_LANE),
+                        help="recompute CXL at this PCIe generation (default: the source run's generation)")
     args = parser.parse_args(argv)
+    if args.output_dir is None:
+        args.output_dir = ROOT / ("double buffering" if args.pcie_gen is None else f"double buffering pcie{args.pcie_gen}")
     source_paths = [args.source]
-    if not args.skip_supplement:
+    if args.supplement_source is not None:
         source_paths.append(args.supplement_source)
     sources = [(f"full_flash{json.loads(path.read_text())['case']['flash_attention_block_size']}", path)
                for path in source_paths]
     if len({label for label, _ in sources}) != len(sources):
         parser.error("Primary and supplement must use different FlashAttention chunk sizes")
-    results = [analyze(source, label, args.output_dir / label, args.trace_search_root, args.cxl_bandwidth_unit)
+    results = [analyze(source, label, args.output_dir / label, args.trace_search_root, args.pcie_gen)
                for label, source in sources]
     comparisons = [{"case": r["label"], "scenario": name, **m["totals"]}
                    for r in results for name, m in r["models"].items()]
@@ -473,7 +489,7 @@ def main(argv=None):
              "名义传输层面：QK 在 3 个 batch 边界有短尾，未覆盖量=128+3×84=380 cycles；SV 因整块 QK/Softmax 依赖保留 15,488 cycles。这些数不直接减原始分项账本。",
              "两套守恒分别校验：名义 wire=名义 hidden+名义 exposed；原 WRGB gap=credited hidden+剩余 WRGB gap。表里的 hidden/remaining 使用第二套口径，均不得为负。",
              "每 kernel 的新 PIM 周期 = 原 PIM 周期 − credited hidden。所有非 WRGB 的 PIM 开销（含 CAS）、PNM 和原 Softmax exposed 公式均保留。",
-             f"CXL 带宽单位：{args.cxl_bandwidth_unit}；单缓冲/双缓冲列统一采用该单位，保留 multicast 50% 折扣、180 ns 固定开销及原 PP handoff 计费。原始 source 文件未修改。",
+             f"CXL：PCIe {results[0]['cxl_bandwidth_model']['pcie_generation']}（source 为 PCIe {results[0]['cxl_bandwidth_model']['source_pcie_generation']}），GB/s；one-shot all-to-all all-reduce，无 multicast 折扣，线上精度 {results[0]['cxl_bandwidth_model']['wire_precision'].upper()}（跟仿真精度），192/256 flit 打包，每次传输 180 ns 固定开销，每 block 一次 PP handoff；单缓冲/双缓冲列统一采用该设置。原始 source 文件未修改。",
              "",
              f"Primary: {results[0]['label']}; source={args.source.resolve()}.",
              *[f"Supplement: {result['label']}; source={result['provenance']['report']['path']}." for result in results[1:]],
@@ -524,7 +540,8 @@ def main(argv=None):
         if migration:
             write_csv(args.output_dir / "migration_comparison.csv", migration)
     notes += ["", "Reproduce from repository root:",
-              f"  python cent_simulation/scripts/analyze_legacy_double_buffering.py --cxl-bandwidth-unit {args.cxl_bandwidth_unit} --plot", "",
+              "  python cent_simulation/scripts/analyze_legacy_double_buffering.py"
+              + ("" if args.pcie_gen is None else f" --pcie-gen {args.pcie_gen}") + " --plot", "",
               "Files per case: summary.txt, analysis.json, dependency_aware_kernels.csv, dependency_aware_waves.csv, ideal_ready_inputs_kernels.csv, ideal_ready_inputs_waves.csv.",
               "Kernel CSV: two header rows, 19 standard cycle-breakdown columns, and Block total. Zero-cost rows are omitted. WRGB is the remaining issued-gap budget; PNM native cycles use the source PNM clock. Detailed overlap fields remain in analysis.json.",
               "Detailed method and assumptions:", *[f"- {a}" for a in results[0]["assumptions"]]]

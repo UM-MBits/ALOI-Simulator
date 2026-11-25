@@ -169,8 +169,10 @@ def main(argv=None):
              "PNM/PIM 计算、CXL 总量、double-buffer overlap 和 block 总延迟均未改变。", ""]
     if "cxl_bandwidth_model" in primary:
         cxl = primary["cxl_bandwidth_model"]
-        lines += [f"本版本 CXL：{cxl['effective_bandwidth_per_device']} {cxl['unit']}/device；multicast 折扣=0.5。",
-                  "拆分保持输入 analysis 的总量；原始模拟 source 仍保留 legacy GiB/s 数值。", ""]
+        lines += [f"本版本 CXL：模型={cxl.get('cxl_model', 'legacy')}，PCIe {cxl.get('pcie_generation', 6)}，"
+                  f"{cxl['effective_bandwidth_per_device']} {cxl['unit']}/device；"
+                  f"multicast 折扣={cxl.get('multicast_bandwidth_factor', 0.5)}。",
+                  "拆分保持输入 analysis 的总量。", ""]
     for view in views:
         t = view["models"]["dependency_aware"]["totals"]
         lines.append(f"{view['label']}/dependency_aware: PIM={t['new_pim_cycles_analytical']:,} cycles; block={t['new_block_us_analytical']:.6f} us; CXL={t['cxl_us_frozen']:.6f} us.")
